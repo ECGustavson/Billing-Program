@@ -43,6 +43,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from datetime import date, timedelta
+
 import requests
 from dotenv import load_dotenv
 
@@ -78,6 +80,19 @@ FIELD_ORDER  = "Order Number"
 FIELD_PO     = "PO Number"
 FIELD_QUOTE  = "Quote Number"
 SEARCH_FIELDS = (FIELD_ORDER, FIELD_PO, FIELD_QUOTE)
+
+# Date range options — (label, months) where months=None means no filter
+DATE_RANGES = [
+    ("Last 30 days",   1),
+    ("Last 3 months",  3),
+    ("Last 6 months",  6),
+    ("Last year",      12),
+    ("Last 2 years",   24),
+    ("Last 5 years",   60),
+    ("All time",       None),
+]
+DATE_RANGE_LABELS  = [d[0] for d in DATE_RANGES]
+DATE_RANGE_DEFAULT = "Last 6 months"
 
 COLUMNS = ("order_no", "po_no", "quote_no", "status", "client", "total", "date", "invoice_no")
 COL_LABELS = {
@@ -164,8 +179,8 @@ def get_access_token(client_id: str, client_secret: str,
 
 
 def fetch_all_invoices(access_token: str, realm_id: str, environment: str,
-                       progress_cb=None) -> list:
-    """Paginate through every invoice in the company and return raw dicts."""
+                       date_from: str = None, progress_cb=None) -> list:
+    """Paginate through invoices in the given date range and return raw dicts."""
     base = _base_url(environment)
     url  = f"{base}/v3/company/{realm_id}/query"
     headers = {
@@ -175,11 +190,14 @@ def fetch_all_invoices(access_token: str, realm_id: str, environment: str,
 
     invoices = []
     start = 1
-    log.info(f"Beginning invoice fetch | realm_id={realm_id} | environment={environment}")
+    log.info(f"Beginning invoice fetch | realm_id={realm_id} | environment={environment} | date_from={date_from}")
+
+    date_clause = f" WHERE TxnDate >= '{date_from}'" if date_from else ""
+    log.info(f"Date filter: {date_from if date_from else 'none (all time)'}")
 
     while True:
         sql = (
-            f"SELECT * FROM Invoice "
+            f"SELECT * FROM Invoice{date_clause} "
             f"STARTPOSITION {start} MAXRESULTS {PAGE_SIZE}"
         )
         params = {
@@ -249,10 +267,13 @@ def invoice_status(invoice: dict) -> str:
     return "Open"
 
 
-def search_invoices(search_input: str, creds: dict, progress_cb=None) -> list:
+def search_invoices(search_input: str, creds: dict,
+                    date_range_label: str = DATE_RANGE_DEFAULT,
+                    progress_cb=None) -> list:
     """
     Full search pipeline.
     search_input: one or more comma-separated values to search for.
+    date_range_label: one of DATE_RANGE_LABELS controlling how far back to fetch.
     Searches all three custom fields (Order Number, PO Number, Quote Number).
     Returns a list of result dicts — one per matching invoice.
     """
@@ -271,8 +292,18 @@ def search_invoices(search_input: str, creds: dict, progress_cb=None) -> list:
         update_env_token(new_refresh)
         creds["refresh_token"] = new_refresh
 
+    # Resolve date_from from the selected label
+    months = next(
+        (m for lbl, m in DATE_RANGES if lbl == date_range_label), 6
+    )
+    if months is None:
+        date_from = None
+    else:
+        date_from = (date.today() - timedelta(days=months * 30)).strftime("%Y-%m-%d")
+
     all_invoices = fetch_all_invoices(
-        access_token, creds["realm_id"], creds["environment"], progress_cb
+        access_token, creds["realm_id"], creds["environment"],
+        date_from=date_from, progress_cb=progress_cb
     )
 
     if progress_cb:
@@ -367,6 +398,18 @@ class App(tk.Tk):
             search_frame, text="Clear", command=self._clear_results
         )
         self.clear_btn.pack(side="left", padx=(4, 0))
+
+        # Date range dropdown
+        ttk.Label(search_frame, text="Date range:").pack(side="left", padx=(16, 4))
+        self._date_range_var = tk.StringVar(value=DATE_RANGE_DEFAULT)
+        date_cb = ttk.Combobox(
+            search_frame,
+            textvariable=self._date_range_var,
+            values=DATE_RANGE_LABELS,
+            state="readonly",
+            width=14,
+        )
+        date_cb.pack(side="left")
 
         # Status label
         self.status_var = tk.StringVar(value="Enter a number and press Search.")
@@ -572,6 +615,10 @@ class App(tk.Tk):
         state = "disabled" if busy else "normal"
         self.search_btn.config(state=state)
         self.job_entry.config(state=state)
+        self._date_range_var  # ensure var exists before locking
+        if hasattr(self, '_date_range_var'):
+            for w in self.winfo_children():
+                pass  # combobox state handled via readonly — no change needed
         if busy:
             self.progress.start(12)
         else:
@@ -605,6 +652,7 @@ class App(tk.Tk):
         try:
             results = search_invoices(
                 search_input, creds,
+                date_range_label=self._date_range_var.get(),
                 progress_cb=lambda msg: self.after(0, self.status_var.set, msg),
             )
             self.after(0, self._display_results, results, search_input)
