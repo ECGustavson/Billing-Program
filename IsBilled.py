@@ -1,8 +1,13 @@
 """
-QuickBooks Online – Job Number Invoice Lookup
-=============================================
-Searches all invoices for a matching "Job Number" custom field value and
-displays the invoice status, client name, total, and invoice date.
+QuickBooks Online – Invoice Lookup
+===================================
+Search by one or more comma-separated values across three custom fields:
+  • Order Number
+  • PO Number
+  • Quote Number
+
+Any invoice matching any search value on any of the three fields is returned.
+All three field values are always displayed for every matched invoice.
 
 Setup
 -----
@@ -57,13 +62,20 @@ log = logging.getLogger("qbo_lookup")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-TOKEN_URL         = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-PAGE_SIZE         = 100
-CUSTOM_FIELD_NAME = "Job Number"   # Change if your QBO field has a different name
+TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+PAGE_SIZE = 100
 
-COLUMNS = ("job_number", "status", "client", "total", "date", "invoice_no")
+# Custom field names exactly as they appear in QBO (case-insensitive match)
+FIELD_ORDER  = "Order Number"
+FIELD_PO     = "PO Number"
+FIELD_QUOTE  = "Quote Number"
+SEARCH_FIELDS = (FIELD_ORDER, FIELD_PO, FIELD_QUOTE)
+
+COLUMNS = ("order_no", "po_no", "quote_no", "status", "client", "total", "date", "invoice_no")
 COL_LABELS = {
-    "job_number": "Job Number",
+    "order_no":   "Order Number",
+    "po_no":      "PO Number",
+    "quote_no":   "Quote Number",
     "status":     "Status",
     "client":     "Client",
     "total":      "Total",
@@ -71,45 +83,37 @@ COL_LABELS = {
     "invoice_no": "Invoice #",
 }
 COL_WIDTHS = {
-    "job_number": 110,
-    "status":      90,
-    "client":      200,
-    "total":        90,
-    "date":        100,
-    "invoice_no":   90,
+    "order_no":   120,
+    "po_no":      110,
+    "quote_no":   110,
+    "status":      80,
+    "client":     180,
+    "total":       85,
+    "date":        95,
+    "invoice_no":  80,
 }
 
 
 # ── .env helpers ───────────────────────────────────────────────────────────────
 
 def update_env_token(new_token: str) -> None:
-    """
-    Write the rotated refresh token back into the .env file in-place.
-    Uses a regex replace so all other lines are preserved exactly.
-    Safe to call from a background thread — writes atomically via a temp file.
-    """
+    """Write the rotated refresh token back into the .env file in-place."""
     try:
         if not os.path.exists(ENV_PATH):
             return
-
         with open(ENV_PATH, "r", encoding="utf-8") as f:
             contents = f.read()
-
         updated = re.sub(
             r"^(QBO_REFRESH_TOKEN\s*=\s*).*$",
             rf"\g<1>{new_token}",
             contents,
             flags=re.MULTILINE,
         )
-
-        # Write to a temp file first, then replace — avoids corruption if the
-        # process is killed mid-write (relevant on a network drive).
         tmp_path = ENV_PATH + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(updated)
         os.replace(tmp_path, ENV_PATH)
         log.info("Refresh token rotated and written to .env successfully.")
-
     except Exception as e:
         log.warning(f"Could not update .env with new refresh token: {e}")
 
@@ -190,7 +194,10 @@ def fetch_all_invoices(access_token: str, realm_id: str, environment: str,
 
         batch = resp.json().get("QueryResponse", {}).get("Invoice", [])
         invoices.extend(batch)
-        log.info(f"Fetched page starting at {start} | {len(batch)} invoices | intuit_tid={intuit_tid}")
+        log.info(
+            f"Fetched page starting at {start} | "
+            f"{len(batch)} invoices | intuit_tid={intuit_tid}"
+        )
 
         if progress_cb:
             progress_cb(f"Fetched {len(invoices)} invoices…")
@@ -203,12 +210,25 @@ def fetch_all_invoices(access_token: str, realm_id: str, environment: str,
     return invoices
 
 
-def extract_job_number(invoice: dict):
-    """Return the Job Number custom field value, or None if absent."""
+def extract_custom_fields(invoice: dict) -> dict:
+    """
+    Extract all three tracked custom field values from an invoice.
+    Returns a dict with keys: order_no, po_no, quote_no.
+    Any field not present on the invoice is returned as an empty string.
+    """
+    field_map = {f.lower(): f for f in SEARCH_FIELDS}
+    values = {f: "" for f in SEARCH_FIELDS}
+
     for cf in invoice.get("CustomField", []):
-        if cf.get("Name", "").strip().lower() == CUSTOM_FIELD_NAME.lower():
-            return cf.get("StringValue", "").strip() or None
-    return None
+        name = cf.get("Name", "").strip().lower()
+        if name in field_map:
+            values[field_map[name]] = cf.get("StringValue", "").strip()
+
+    return {
+        "order_no":  values[FIELD_ORDER],
+        "po_no":     values[FIELD_PO],
+        "quote_no":  values[FIELD_QUOTE],
+    }
 
 
 def invoice_status(invoice: dict) -> str:
@@ -221,15 +241,24 @@ def invoice_status(invoice: dict) -> str:
     return "Open"
 
 
-def search_invoices(job_number: str, creds: dict, progress_cb=None) -> list:
-    """Full search pipeline. Returns a list of result dicts."""
-    log.info(f"Search started | job_number='{job_number}'")
+def search_invoices(search_input: str, creds: dict, progress_cb=None) -> list:
+    """
+    Full search pipeline.
+    search_input: one or more comma-separated values to search for.
+    Searches all three custom fields (Order Number, PO Number, Quote Number).
+    Returns a list of result dicts — one per matching invoice.
+    """
+    # Parse comma-separated search terms, strip whitespace, drop blanks
+    search_terms = [t.strip().lower() for t in search_input.split(",") if t.strip()]
+    if not search_terms:
+        return []
+
+    log.info(f"Search started | terms={search_terms}")
+
     access_token, new_refresh = get_access_token(
         creds["client_id"], creds["client_secret"], creds["refresh_token"]
     )
 
-    # If the token rotated, silently write it back to .env so all machines
-    # stay in sync (since the script and .env live together on the network drive).
     if new_refresh != creds["refresh_token"]:
         update_env_token(new_refresh)
         creds["refresh_token"] = new_refresh
@@ -241,15 +270,38 @@ def search_invoices(job_number: str, creds: dict, progress_cb=None) -> list:
     if progress_cb:
         progress_cb(
             f"Scanning {len(all_invoices)} invoices for "
-            f"Job Number '{job_number}'…"
+            f"{len(search_terms)} term(s)…"
         )
 
     results = []
+    seen_ids = set()  # Prevent duplicate rows if multiple fields match
+
     for inv in all_invoices:
-        jn = extract_job_number(inv)
-        if jn and jn.lower() == job_number.strip().lower():
+        fields = extract_custom_fields(inv)
+
+        # Check if any search term matches any of the three field values
+        field_values = [
+            fields["order_no"].lower(),
+            fields["po_no"].lower(),
+            fields["quote_no"].lower(),
+        ]
+        matched = any(
+            term == val
+            for term in search_terms
+            for val in field_values
+            if val  # skip empty fields
+        )
+
+        if matched:
+            inv_id = inv.get("Id")
+            if inv_id in seen_ids:
+                continue
+            seen_ids.add(inv_id)
+
             results.append({
-                "job_number": jn,
+                "order_no":   fields["order_no"],
+                "po_no":      fields["po_no"],
+                "quote_no":   fields["quote_no"],
                 "status":     invoice_status(inv),
                 "client":     inv.get("CustomerRef", {}).get("name", "—"),
                 "total":      f"${float(inv.get('TotalAmt', 0)):,.2f}",
@@ -257,7 +309,9 @@ def search_invoices(job_number: str, creds: dict, progress_cb=None) -> list:
                 "invoice_no": inv.get("DocNumber", "—"),
             })
 
-    log.info(f"Search complete | job_number='{job_number}' | matches={len(results)}")
+    log.info(
+        f"Search complete | terms={search_terms} | matches={len(results)}"
+    )
     return results
 
 
@@ -266,9 +320,9 @@ def search_invoices(job_number: str, creds: dict, progress_cb=None) -> list:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("QBO Job Number Lookup")
+        self.title("QBO Invoice Lookup")
         self.resizable(True, True)
-        self.minsize(740, 480)
+        self.minsize(860, 480)
         self._build_ui()
         self._load_env_into_fields()
         log.info("Application started.")
@@ -286,10 +340,13 @@ class App(tk.Tk):
         self.notebook.add(tab, text="  Search  ")
 
         # Search bar
-        search_frame = ttk.LabelFrame(tab, text="Job Number", padding=8)
+        search_frame = ttk.LabelFrame(
+            tab, text="Search  (Order Number, PO Number, or Quote Number — comma-separate multiple)",
+            padding=8
+        )
         search_frame.pack(fill="x")
 
-        self.job_entry = ttk.Entry(search_frame, font=("", 12), width=28)
+        self.job_entry = ttk.Entry(search_frame, font=("", 12), width=40)
         self.job_entry.pack(side="left", padx=(0, 8), ipady=4)
         self.job_entry.bind("<Return>", lambda _: self._run_search())
 
@@ -304,7 +361,7 @@ class App(tk.Tk):
         self.clear_btn.pack(side="left", padx=(4, 0))
 
         # Status label
-        self.status_var = tk.StringVar(value="Enter a Job Number and press Search.")
+        self.status_var = tk.StringVar(value="Enter a number and press Search.")
         ttk.Label(tab, textvariable=self.status_var, foreground="#555").pack(
             anchor="w", pady=(8, 2)
         )
@@ -470,7 +527,7 @@ class App(tk.Tk):
         for row in self.tree.get_children():
             self.tree.delete(row)
         self.job_entry.delete(0, "end")
-        self.status_var.set("Enter a Job Number and press Search.")
+        self.status_var.set("Enter a number and press Search.")
 
     def _set_busy(self, busy: bool):
         state = "disabled" if busy else "normal"
@@ -484,16 +541,15 @@ class App(tk.Tk):
     # ── Search (runs in a background thread) ───────────────────────────────────
 
     def _run_search(self):
-        job_number = self.job_entry.get().strip()
-        if not job_number:
-            messagebox.showwarning("No Input", "Please enter a Job Number.")
+        search_input = self.job_entry.get().strip()
+        if not search_input:
+            messagebox.showwarning("No Input", "Please enter a number to search.")
             return
 
         creds = self._get_creds()
         if creds is None:
             return
 
-        # Clear old results
         for row in self.tree.get_children():
             self.tree.delete(row)
 
@@ -502,17 +558,17 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._search_thread,
-            args=(job_number, creds),
+            args=(search_input, creds),
             daemon=True,
         ).start()
 
-    def _search_thread(self, job_number: str, creds: dict):
+    def _search_thread(self, search_input: str, creds: dict):
         try:
             results = search_invoices(
-                job_number, creds,
+                search_input, creds,
                 progress_cb=lambda msg: self.after(0, self.status_var.set, msg),
             )
-            self.after(0, self._display_results, results, job_number)
+            self.after(0, self._display_results, results, search_input)
         except requests.HTTPError as e:
             msg = str(e)
             log.error(f"HTTPError during search | {msg}")
@@ -525,12 +581,14 @@ class App(tk.Tk):
             log.exception(f"Unexpected error during search: {e}")
             self.after(0, self._on_error, str(e))
 
-    def _display_results(self, results: list, job_number: str):
+    def _display_results(self, results: list, search_input: str):
         self._set_busy(False)
+
+        terms = [t.strip() for t in search_input.split(",") if t.strip()]
 
         if not results:
             self.status_var.set(
-                f"No invoices found with Job Number '{job_number}'."
+                f"No invoices found matching: {', '.join(terms)}"
             )
             return
 
@@ -538,7 +596,9 @@ class App(tk.Tk):
             self.tree.insert(
                 "", "end",
                 values=(
-                    r["job_number"],
+                    r["order_no"],
+                    r["po_no"],
+                    r["quote_no"],
                     r["status"],
                     r["client"],
                     r["total"],
@@ -551,7 +611,7 @@ class App(tk.Tk):
         n = len(results)
         self.status_var.set(
             f"Found {n} invoice{'s' if n != 1 else ''} "
-            f"for Job Number '{job_number}'."
+            f"matching: {', '.join(terms)}"
         )
 
     def _on_error(self, message: str):
