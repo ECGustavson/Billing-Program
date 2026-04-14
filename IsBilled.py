@@ -35,6 +35,8 @@ Notes
 """
 
 import os
+import sys
+import subprocess
 import re
 import logging
 import threading
@@ -46,8 +48,14 @@ from dotenv import load_dotenv
 
 # Always load .env from the same directory as this script, regardless of
 # where Python is launched from — important when running off a network drive.
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qbo_lookup.log")
+# Resolve base directory — works both running from source and as a PyInstaller .exe
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+LOG_PATH = os.path.join(BASE_DIR, "qbo_lookup.log")
 load_dotenv(ENV_PATH)
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
@@ -436,9 +444,12 @@ class App(tk.Tk):
 
         tab.columnconfigure(1, weight=1)
 
-        ttk.Button(tab, text="Save Settings", command=self._save_settings).grid(
-            row=len(fields) + 1, column=1, sticky="e", pady=(18, 0)
-        )
+        btn_frame = ttk.Frame(tab)
+        btn_frame.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Button(btn_frame, text="Save Settings", command=self._save_settings).pack(side="right")
+        ttk.Button(
+            btn_frame, text="Re-authorize QBO…", command=self._launch_get_refresh
+        ).pack(side="right", padx=(0, 8))
         ttk.Label(
             tab,
             text=(
@@ -522,6 +533,34 @@ class App(tk.Tk):
         except Exception as e:
             log.error(f"Failed to save settings to .env: {e}")
             messagebox.showerror("Save Failed", f"Could not write to .env:\n{e}")
+
+    def _launch_get_refresh(self):
+        """Launch GetRefresh.py (or GetRefresh.exe) to re-run the OAuth flow."""
+        if getattr(sys, "frozen", False):
+            # Running as PyInstaller bundle — look for GetRefresh.exe alongside the exe
+            target = os.path.join(BASE_DIR, "GetRefresh.exe")
+            if not os.path.exists(target):
+                msg = "GetRefresh.exe not found next to IsBilled.exe.\n\nExpected at:\n" + target
+                messagebox.showerror("Not Found", msg)
+                return
+            log.info("Launching GetRefresh.exe for re-authorization.")
+            subprocess.Popen([target])
+        else:
+            # Running from source — launch GetRefresh.py with the same Python interpreter
+            target = os.path.join(BASE_DIR, "GetRefresh.py")
+            if not os.path.exists(target):
+                msg = "GetRefresh.py not found next to IsBilled.py.\n\nExpected at:\n" + target
+                messagebox.showerror("Not Found", msg)
+                return
+            log.info("Launching GetRefresh.py for re-authorization.")
+            subprocess.Popen([sys.executable, target])
+
+        messagebox.showinfo(
+            "Re-authorization Launched",
+            "GetRefresh has opened in a new window.\n\n"
+            "Complete the QuickBooks login in your browser.\n"
+            "Your .env will be updated automatically when done."
+        )
 
     def _clear_results(self):
         for row in self.tree.get_children():
